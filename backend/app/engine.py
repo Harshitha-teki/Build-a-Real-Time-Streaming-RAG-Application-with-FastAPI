@@ -3,11 +3,15 @@ from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_chroma import Chroma
 
 # 1. Use local embeddings (Free & Fast)
-embeddings = OllamaEmbeddings(model="llama3:4b")
-
+embeddings = OllamaEmbeddings(
+    model="nomic-embed-text", 
+    base_url="http://host.docker.internal:11434"
+)
 # 2. Use local LLM (Free & No Quota limits)
-llm = ChatOllama(model="llama3:4b", streaming=True)
-
+llm = ChatOllama(
+    model="llama3.2:1b", 
+    base_url="http://host.docker.internal:11434"
+)
 vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
 
 async def get_streaming_rag_response(query):

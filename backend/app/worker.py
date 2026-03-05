@@ -2,12 +2,15 @@ import json
 import asyncio
 import redis.asyncio as redis
 from langchain_text_splitters import RecursiveCharacterTextSplitter # Use this specific package
-from langchain_openai import OpenAIEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
 
 async def process_queue():
     r = redis.Redis(host='redis', port=6379, decode_responses=True)
-    embeddings = OpenAIEmbeddings()
+    embeddings = OllamaEmbeddings(
+        model="nomic-embed-text", 
+        base_url="http://host.docker.internal:11434"
+    )
     vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
     
     print("Worker started. Listening for tasks...")

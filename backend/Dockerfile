@@ -18,8 +18,7 @@ RUN apt-get update && apt-get install -y \
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir --default-timeout=100 -r requirements.txt
-# Copy project
+RUN pip install --no-cache-dir --default-timeout=100 -r requirements.txt 
 COPY . .
 
 # Default command (will be overridden by docker-compose for the worker)
