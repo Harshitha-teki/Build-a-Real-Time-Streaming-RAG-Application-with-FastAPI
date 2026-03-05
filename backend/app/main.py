@@ -1,38 +1,38 @@
 import os
 import json
 import asyncio
+from fastapi import FastAPI, UploadFile, File, HTTPException
+
+# 1. Directory for shared file storage between App and Worker
+UPLOAD_DIR = "/app/data"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 try:
     import chainlit as cl
     from chainlit.utils import mount_chainlit
     CHAINLIT_AVAILABLE = True
 except Exception:
-    # Chainlit is optional for running the FastAPI app. If it's not installed
-    # the app will still start; Chainlit-specific features will be disabled.
     cl = None
     mount_chainlit = None
     CHAINLIT_AVAILABLE = False
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
-
-# Use full package import
+# Import RAG engine
 try:
     from app.engine import get_streaming_rag_response
     ENGINE_AVAILABLE = True
 except Exception as e:
-    # Engine or its dependencies might be missing in this environment.
     ENGINE_AVAILABLE = False
     async def get_streaming_rag_response(*args, **kwargs):
         raise RuntimeError(f"Engine not available: {e}")
 
 app = FastAPI()
 
-# Redis connection (optional)
+# Redis connection
 try:
     import redis.asyncio as redis
     redis_client = redis.from_url("redis://redis:6379", decode_responses=True)
     REDIS_AVAILABLE = True
 except Exception:
-    redis = None
     redis_client = None
     REDIS_AVAILABLE = False
 
@@ -42,16 +42,40 @@ async def health_check():
 
 @app.post("/ingest")
 async def ingest_file(file: UploadFile = File(...)):
-    content = await file.read()
-    task = {
-        "filename": file.filename,
-        "content": content.decode("utf-8")
-    }
     if not REDIS_AVAILABLE or redis_client is None:
-        raise HTTPException(status_code=503, detail="Redis is not available. Install 'redis' package or run in an environment with Redis client available.")
+        raise HTTPException(status_code=503, detail="Redis connection unavailable.")
 
-    await redis_client.lpush("ingest_queue", json.dumps(task))
-    return {"message": f"Successfully queued {file.filename}"}
+    # Validate file type
+    ALLOWED_EXTENSIONS = {'.pdf', '.pptx', '.ppt', '.docx', '.doc', '.txt'}
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported file type: {file_ext}. Supported formats: PDF, PPTX, DOCX, TXT"
+        )
+
+    try:
+        # Save the actual file to the shared volume
+        file_path = os.path.join(UPLOAD_DIR, file.filename)
+        
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+        # Send the FILE PATH to the worker
+        task = {
+            "filename": file.filename,
+            "file_path": file_path
+        }
+
+        # Match the queue name used in worker.py
+        await redis_client.lpush("ingestion_queue", json.dumps(task))
+        
+        return {"message": f"Successfully queued {file.filename} for processing"}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
 
 # --- Chainlit Logic ---
 
@@ -59,32 +83,69 @@ if CHAINLIT_AVAILABLE:
     @cl.on_chat_start
     async def start():
         cl.user_session.set("history", [])
-        await cl.Message(content="RAG System Ready.").send()
+        await cl.Message(content="🚀 RAG System Online. Upload a document to begin!").send()
 
     @cl.on_message
-    async def main(message: cl.Message):
-        msg = cl.Message(content="")
-        async for token in get_streaming_rag_response(message.content):
-            await msg.stream_token(token)
-        await msg.send()
-else:
-    # Provide a minimal fallback so importing this module still works when
-    # Chainlit isn't installed. This keeps the FastAPI endpoints functioning.
-    async def start():
-        return None
+    async def main_chat(message: cl.Message):
+        # 1. Handle File Uploads via Chainlit UI
+        if message.elements:
+            ALLOWED_EXTENSIONS = {'.pdf', '.pptx', '.ppt', '.docx', '.doc', '.txt'}
+            
+            for element in message.elements:
+                if element.type in ["file", "text"]:
+                    # Validate file extension
+                    file_ext = os.path.splitext(element.name)[1].lower()
+                    if file_ext not in ALLOWED_EXTENSIONS:
+                        await cl.Message(
+                            content=f"⚠️ Unsupported file type: {file_ext}. Supported: PDF, PPTX, DOCX, TXT"
+                        ).send()
+                        continue
+                    
+                    try:
+                        file_path = os.path.join(UPLOAD_DIR, element.name)
+                        
+                        # Handle content stored in memory or on disk
+                        if element.content is not None:
+                            content = element.content
+                        elif element.path is not None and os.path.exists(element.path):
+                            with open(element.path, "rb") as f:
+                                content = f.read()
+                        else:
+                            await cl.Message(content=f"⚠️ Could not read {element.name}").send()
+                            continue
 
-    async def main(message):
-        # No-op fallback
-        return None
+                        # Write to shared volume
+                        with open(file_path, "wb") as f:
+                            f.write(content)
+                        
+                        # Trigger Worker Ingestion
+                        task = {"filename": element.name, "file_path": file_path}
+                        await redis_client.lpush("ingestion_queue", json.dumps(task))
+                        await cl.Message(content=f"✅ `{element.name}` received. Indexing into ChromaDB...").send()
+                    
+                    except Exception as e:
+                        await cl.Message(content=f"❌ Ingestion Error: {str(e)}").send()
+                        # Trigger Worker Ingestion
+                        task = {"filename": element.name, "file_path": file_path}
+                        await redis_client.lpush("ingestion_queue", json.dumps(task))
+                        await cl.Message(content=f"✅ `{element.name}` received. Indexing into ChromaDB...").send()
+                    
+                    except Exception as e:
+                        await cl.Message(content=f"❌ Ingestion Error: {str(e)}").send()
 
-# --- Mounting Logic (THE FIX) ---
+        # 2. Handle Chat Response (RAG Retrieval + Generation)
+        if message.content:
+            msg = cl.Message(content="")
+            try:
+                async for token in get_streaming_rag_response(message.content):
+                    await msg.stream_token(token)
+                await msg.send()
+            except Exception as e:
+                await cl.Message(content=f"❌ Error generating response: {str(e)}").send()
 
-# We only want to mount if this is the FastAPI process starting up.
-# Chainlit sets an environment variable when it's the one doing the loading.
+# --- Mounting Logic ---
+
 if CHAINLIT_AVAILABLE and not os.environ.get("CHAINLIT_RUN"):
-    # Prevent mount_chainlit from re-importing this module and causing a
-    # recursive loop. Set the environment variable so subsequent imports by
-    # chainlit's loader won't try to mount again.
     os.environ["CHAINLIT_RUN"] = "1"
     current_file_path = os.path.abspath(__file__)
     mount_chainlit(app, target=current_file_path, path="/")

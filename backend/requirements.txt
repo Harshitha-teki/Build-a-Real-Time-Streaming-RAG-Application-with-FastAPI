@@ -7,3 +7,9 @@ langchain
 langchain-community
 langchain-ollama
 langchain-chroma
+pypdf
+unstructured
+python-pptx
+python-docx
+pillow
+openpyxl
